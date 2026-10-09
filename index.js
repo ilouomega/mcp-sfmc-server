@@ -1,25 +1,38 @@
-const express = require('express');
-const { SSEServerTransport } = require('@modelcontextprotocol/sdk/server/sse.js');
-const { spawn } = require('child_process');
+import express from "express";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+app.use(express.json());
 
-app.get('/mcp/sse', async (req, res) => {
-  console.log('Copilot Studio se ha conectado vía SSE');
-  const transport = new SSEServerTransport('/mcp/messages', res);
+// Mapa para gestionar sesiones activas
+const transports = new Map();
 
-  const mcpProcess = spawn('npx', ['-y', 'mcp-server-sfmc'], {
-    env: {
-      ...process.env,
-      SFMC_CLIENT_ID: process.env.SFMC_CLIENT_ID,
-      SFMC_CLIENT_SECRET: process.env.SFMC_CLIENT_SECRET,
-      SFMC_SUBDOMAIN: process.env.SFMC_SUBDOMAIN,
-      SFMC_MID: process.env.SFMC_MID
-    }
+// 1. Endpoint para iniciar la conexión SSE (debe soportar /sse y /mcp/sse)
+app.get(["/sse", "/mcp/sse"], async (req, res) => {
+  console.log("Nueva conexión SSE entrante desde Copilot Studio...");
+  
+  const transport = new SSEServerTransport("/messages", res);
+  transports.set(transport.sessionId, transport);
+
+  await server.connect(transport);
+
+  req.on("close", () => {
+    transports.delete(transport.sessionId);
   });
-
-  await transport.start();
 });
 
-app.listen(PORT, () => console.log(`Servidor MCP escuchando en puerto ${PORT}`));
+// 2. Endpoint para recibir mensajes POST JSON-RPC (debe soportar /messages y /mcp/messages)
+app.post(["/messages", "/mcp/messages"], async (req, res) => {
+  const sessionId = req.query.sessionId;
+  const transport = transports.get(sessionId);
+
+  if (transport) {
+    await transport.handlePostMessage(req, res);
+  } else {
+    res.status(404).json({ error: "Session not found" });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`MCP Server running on port ${PORT}`));
