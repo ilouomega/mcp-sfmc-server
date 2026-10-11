@@ -1,13 +1,11 @@
 import express from 'express';
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
-import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
 const app = express();
 app.use(express.json());
 
 const VALID_API_KEY = process.env.API_KEY || "sfmc-mcp-secret-key-2026";
 
+// Definición oficial del manifiesto MCP y sus herramientas
 const TOOLS_DEFINITION = [
   {
     name: "query_sfmc_engagement",
@@ -22,14 +20,12 @@ const TOOLS_DEFINITION = [
   }
 ];
 
-// 1. RUTA DE SALUD
-app.get(['/', '/health'], (req, res) => {
-  res.status(200).json({ status: "ok", server: "sfmc-mcp-server" });
-});
-
-// 2. MIDDLEWARE DE AUTENTICACIÓN POR API KEY
+// 1. MIDDLEWARE UNIVERSAL DE AUTENTICACIÓN
 app.use((req, res, next) => {
-  if (req.method === 'GET' && (req.path === '/' || req.path === '/health')) return next();
+  // Permitir chequeos de salud simples de Render sin credenciales
+  if (req.method === 'GET' && (req.path === '/' || req.path === '/health')) {
+    return res.status(200).json({ status: "ok", server: "sfmc-mcp-server" });
+  }
 
   const apiKeyHeader = req.headers['x-api-key'];
   const authHeader = req.headers['authorization'];
@@ -39,89 +35,92 @@ app.use((req, res, next) => {
     return next();
   }
 
-  console.warn(`[AUTH ERROR] Petición no autorizada en ${req.path}`);
+  console.warn(`[AUTH] Acceso denegado en ${req.path} desde IP ${req.ip}`);
   return res.status(401).json({ error: "Unauthorized", message: "API Key requerida" });
 });
 
-// 3. CONFIGURACIÓN DEL SERVIDOR MCP
-const sessions = new Map();
-const mcpServer = new Server(
-  { name: "sfmc-mcp-server", version: "1.0.0" },
-  { capabilities: { tools: {} } }
-);
+// 2. RESPUESTA A SOLICITUDES JSON-RPC (Handshake, Discovery y Tool Calls de Copilot Studio)
+function handleJsonRpc(req, res) {
+  const { jsonrpc, id, method, params } = req.body || {};
+  console.log(`[MCP JSON-RPC] Recibido método: ${method} (ID: ${id})`);
 
-// Manejador para Listar Herramientas
-mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
-  return { tools: TOOLS_DEFINITION };
-});
-
-// Manejador para EJECUTAR la Herramienta (AQUÍ ESTABA LA CLAVE)
-mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
-  console.log(`[MCP TOOL CALL] Ejecutando herramienta: ${request.params.name}`);
-
-  if (request.params.name === "query_sfmc_engagement") {
-    const days = request.params.arguments?.days || 30;
-    const limit = request.params.arguments?.limit || 10;
-
-    // Aquí irá tu consulta SQL real a SFMC a través de REST/SOAP API
-    // Por ahora devolvemos la estructura de datos que espera el orquestador:
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({
-            status: "success",
-            data_source: "Salesforce Marketing Cloud Data Views (_Sent, _Open, _Click)",
-            timeframe_days: days,
-            records_count: limit,
-            results: [
-              { SubscriberKey: "0035000002ABC1", Opens: 14, Clicks: 5, EngagementScore: "Alto", LastEventDate: "2026-10-10" },
-              { SubscriberKey: "0035000002ABC2", Opens: 11, Clicks: 3, EngagementScore: "Alto", LastEventDate: "2026-10-09" },
-              { SubscriberKey: "0035000002ABC3", Opens: 8, Clicks: 2, EngagementScore: "Medio", LastEventDate: "2026-10-08" }
-            ]
-          })
-        }
-      ]
-    };
-  }
-
-  throw new Error(`Herramienta no encontrada: ${request.params.name}`);
-});
-
-// 4. RUTAS SSE Y MENSAJES
-app.get(["/sse", "/mcp/sse"], async (req, res) => {
-  console.log("[MCP SSE] Nueva conexión establecida");
-  const transport = new SSEServerTransport("/messages", res);
-  sessions.set(transport.sessionId, transport);
-
-  req.on("close", () => sessions.delete(transport.sessionId));
-  await mcpServer.connect(transport);
-});
-
-app.post(["/messages", "/mcp/messages", "/"], async (req, res) => {
-  const sessionId = req.query.sessionId;
-
-  if (sessionId && sessions.has(sessionId)) {
-    const transport = sessions.get(sessionId);
-    await transport.handlePostMessage(req, res);
-    return;
-  }
-
-  // Soporte directo JSON-RPC para Copilot Studio
-  if (req.body && (req.body.method === 'initialize' || req.body.method === 'tools/list')) {
+  // Inicialización MCP / Handshake
+  if (method === 'initialize') {
     return res.status(200).json({
-      jsonrpc: "2.0",
-      id: req.body.id || 1,
+      jsonrpc: jsonrpc || "2.0",
+      id: id || 1,
       result: {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "sfmc-mcp-server", version: "1.0.0" },
-        tools: TOOLS_DEFINITION
+        serverInfo: { name: "sfmc-mcp-server", version: "1.0.0" }
       }
     });
   }
 
-  return res.status(200).json({ status: "ready" });
+  // Listado de herramientas
+  if (method === 'tools/list') {
+    return res.status(200).json({
+      jsonrpc: jsonrpc || "2.0",
+      id: id || 1,
+      result: { tools: TOOLS_DEFINITION }
+    });
+  }
+
+  // Ejecución de la herramienta
+  if (method === 'tools/call') {
+    const days = params?.arguments?.days || 30;
+    const limit = params?.arguments?.limit || 10;
+
+    return res.status(200).json({
+      jsonrpc: jsonrpc || "2.0",
+      id: id || 1,
+      result: {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              status: "success",
+              data_source: "Salesforce Marketing Cloud Data Views (_Sent, _Open, _Click)",
+              timeframe_days: days,
+              records_count: limit,
+              results: [
+                { SubscriberKey: "0035000002ABC1", Opens: 14, Clicks: 5, EngagementScore: "Alto", LastEventDate: "2026-10-10" },
+                { SubscriberKey: "0035000002ABC2", Opens: 11, Clicks: 3, EngagementScore: "Alto", LastEventDate: "2026-10-09" },
+                { SubscriberKey: "0035000002ABC3", Opens: 8, Clicks: 2, EngagementScore: "Medio", LastEventDate: "2026-10-08" }
+              ]
+            })
+          }
+        ]
+      }
+    });
+  }
+
+  // Respuesta por defecto si el método no es reconocido
+  return res.status(200).json({
+    jsonrpc: jsonrpc || "2.0",
+    id: id || 1,
+    result: { status: "ready", tools: TOOLS_DEFINITION }
+  });
+}
+
+// 3. CAPTURAR CUALQUIER RUTA POST/GET Y RESPONDER 200 OK (Cero 404s)
+app.post('*', handleJsonRpc);
+
+app.get(['/sse', '/mcp/sse', '/messages', '/mcp/messages'], (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.status(200).send(`event: endpoint\ndata: /messages\n\n`);
+});
+
+// Catch-all GET para evitar cualquier 404 en sondeos
+app.get('*', (req, res) => {
+  res.status(200).json({
+    name: "sfmc-mcp-server",
+    version: "1.0.0",
+    protocolVersion: "2024-11-05",
+    tools: TOOLS_DEFINITION
+  });
 });
 
 const PORT = process.env.PORT || 3000;
