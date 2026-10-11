@@ -65,7 +65,8 @@ async function getSFMCAccessToken() {
 async function fetchSOAPEventData(objectType, accessToken, soapEndpoint, days = 30) {
   const dateFrom = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
 
-  const soapEnvelope = `<?xml version="1.0" encoding="UTF-8"?>
+  // En index.js, actualiza el sobre SOAP para forzar el MID (Client.ClientID):
+const soapEnvelope = `<?xml version="1.0" encoding="UTF-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing">
     <s:Header>
         <a:Action s:mustUnderstand="1">Retrieve</a:Action>
@@ -76,13 +77,11 @@ async function fetchSOAPEventData(objectType, accessToken, soapEndpoint, days = 
         <RetrieveRequestMsg xmlns="http://exacttarget.com/wsdl/partnerAPI">
             <RetrieveRequest>
                 <ObjectType>${objectType}</ObjectType>
+                <Client>
+                    <ClientID>${SFMC_MID || '7295121'}</ClientID>
+                </Client>
                 <Properties>SubscriberKey</Properties>
                 <Properties>EventDate</Properties>
-                <Filter xsi:type="SimpleFilterPart">
-                    <Property>EventDate</Property>
-                    <SimpleOperator>greaterThan</SimpleOperator>
-                    <Value>${dateFrom}</Value>
-                </Filter>
             </RetrieveRequest>
         </RetrieveRequestMsg>
     </s:Body>
