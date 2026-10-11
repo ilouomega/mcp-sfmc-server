@@ -1,46 +1,36 @@
 import express from 'express';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
 const app = express();
 app.use(express.json());
 
-// -------------------------------------------------------------
-// 1. RUTA DE SALUD LIBRE (Para comprobaciones rápidas)
-// -------------------------------------------------------------
-app.get('/health', (req, res) => {
-  res.status(200).send('OK');
+// 1. RUTA DE SALUD Y COMPROBACIÓN BÁSICA (Evita 404 en sondeos de Copilot)
+app.get(['/', '/health', '/mcp'], (req, res) => {
+  res.status(200).json({ status: "ok", server: "sfmc-mcp-server" });
 });
 
-// -------------------------------------------------------------
 // 2. MIDDLEWARE DE AUTENTICACIÓN POR API KEY
-// -------------------------------------------------------------
-const VALID_API_KEY = process.env.API_KEY || "mi_clave_secreta_sfmc_12345";
+const VALID_API_KEY = process.env.API_KEY || "sfmc-mcp-secret-key-2026";
 
 app.use((req, res, next) => {
-  // Copilot Studio enviará la clave en x-api-key o mediante Authorization Header
+  // Ignorar autenticación solo para la ruta libre de salud
+  if (req.path === '/' || req.path === '/health') return next();
+
   const apiKeyHeader = req.headers['x-api-key'];
   const authHeader = req.headers['authorization'];
-
   const providedKey = apiKeyHeader || (authHeader ? authHeader.replace('Bearer ', '') : null);
 
-  // Si coincide la clave, dejamos pasar la petición
   if (providedKey && providedKey === VALID_API_KEY) {
     return next();
   }
 
-  // Si falla o no viene la clave, devolvemos 401 Unauthorized
-  console.warn(`[AUTH] Acceso rechazado desde IP ${req.ip} a ${req.path}`);
-  return res.status(401).json({ 
-    error: "Unauthorized", 
-    message: "Falta la API Key o es incorrecta en el encabezado x-api-key" 
-  });
+  console.warn(`[AUTH] Intento no autorizado desde IP ${req.ip} a ${req.path}`);
+  return res.status(401).json({ error: "Unauthorized", message: "Clave de API inválida o no proporcionada" });
 });
 
-// -------------------------------------------------------------
-// 3. CONFIGURACIÓN DEL SERVIDOR MCP Y SUS RUTAS PROTEGIDAS
-// -------------------------------------------------------------
+// 3. CONFIGURACIÓN DEL SERVIDOR MCP
 const sessions = new Map();
 
 const mcpServer = new Server(
@@ -48,7 +38,6 @@ const mcpServer = new Server(
   { capabilities: { tools: {} } }
 );
 
-// Declarar las herramientas para que Copilot Studio pueda descubrirlas
 mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
@@ -67,8 +56,9 @@ mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
-// Endpoint SSE
+// 4. ENDPOINTS SSE Y MESSAGES (Aceptan múltiples variaciones de ruta)
 app.get(["/sse", "/mcp/sse"], async (req, res) => {
+  console.log("[MCP] Nueva conexión SSE entrante...");
   const transport = new SSEServerTransport("/messages", res);
   sessions.set(transport.sessionId, transport);
 
@@ -79,7 +69,6 @@ app.get(["/sse", "/mcp/sse"], async (req, res) => {
   await mcpServer.connect(transport);
 });
 
-// Endpoint para recibir los mensajes POST del cliente (Copilot Studio)
 app.post(["/messages", "/mcp/messages"], async (req, res) => {
   const sessionId = req.query.sessionId;
   const transport = sessions.get(sessionId);
