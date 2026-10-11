@@ -6,10 +6,43 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 const app = express();
 app.use(express.json());
 
-// Mapa de sesiones SSE
+// -------------------------------------------------------------
+// 1. RUTA DE SALUD LIBRE (Para comprobaciones rápidas)
+// -------------------------------------------------------------
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
+});
+
+// -------------------------------------------------------------
+// 2. MIDDLEWARE DE AUTENTICACIÓN POR API KEY
+// -------------------------------------------------------------
+const VALID_API_KEY = process.env.API_KEY || "mi_clave_secreta_sfmc_12345";
+
+app.use((req, res, next) => {
+  // Copilot Studio enviará la clave en x-api-key o mediante Authorization Header
+  const apiKeyHeader = req.headers['x-api-key'];
+  const authHeader = req.headers['authorization'];
+
+  const providedKey = apiKeyHeader || (authHeader ? authHeader.replace('Bearer ', '') : null);
+
+  // Si coincide la clave, dejamos pasar la petición
+  if (providedKey && providedKey === VALID_API_KEY) {
+    return next();
+  }
+
+  // Si falla o no viene la clave, devolvemos 401 Unauthorized
+  console.warn(`[AUTH] Acceso rechazado desde IP ${req.ip} a ${req.path}`);
+  return res.status(401).json({ 
+    error: "Unauthorized", 
+    message: "Falta la API Key o es incorrecta en el encabezado x-api-key" 
+  });
+});
+
+// -------------------------------------------------------------
+// 3. CONFIGURACIÓN DEL SERVIDOR MCP Y SUS RUTAS PROTEGIDAS
+// -------------------------------------------------------------
 const sessions = new Map();
 
-// Crear servidor MCP
 const mcpServer = new Server(
   { name: "sfmc-mcp-server", version: "1.0.0" },
   { capabilities: { tools: {} } }
@@ -54,10 +87,9 @@ app.post(["/messages", "/mcp/messages"], async (req, res) => {
   if (transport) {
     await transport.handlePostMessage(req, res);
   } else {
-    // Si la sesión caduca o no coincide la ruta
     res.status(404).json({ error: "Session not found" });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`Server listening on port ${PORT}`));
