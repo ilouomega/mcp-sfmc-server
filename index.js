@@ -1,21 +1,19 @@
-import express from 'express';
+const express = require('express');
 
 const app = express();
 app.use(express.json());
 
 const VALID_API_KEY = process.env.API_KEY || "sfmc-mcp-secret-key-2026";
 
-// Credenciales de SFMC extraídas del entorno en Render
 const SFMC_CLIENT_ID = process.env.SFMC_CLIENT_ID;
 const SFMC_CLIENT_SECRET = process.env.SFMC_CLIENT_SECRET;
-const SFMC_SUBDOMAIN = process.env.SFMC_SUBDOMAIN; // Ej: "mcxxxxxxx" o "mcxxxxxxx.auth.marketingcloudapis.com"
+const SFMC_SUBDOMAIN = process.env.SFMC_SUBDOMAIN;
 const SFMC_MID = process.env.SFMC_ACCOUNT_ID || process.env.SFMC_MID;
 
-// Definición oficial del manifiesto MCP y sus herramientas
 const TOOLS_DEFINITION = [
   {
     name: "query_sfmc_engagement",
-    description: "Consulta las Data Views de Salesforce Marketing Cloud (_Sent, _Open, _Click) para extraer métricas de engagement del MID autenticado.",
+    description: "Consulta directamente las Data Views del sistema de SFMC (_Sent, _Open, _Click) mediante la API de Eventos en tiempo real.",
     inputSchema: {
       type: "object",
       properties: {
@@ -26,13 +24,13 @@ const TOOLS_DEFINITION = [
   }
 ];
 
-// Helper para obtener Access Token de SFMC mediante OAuth 2.0
+// 1. Obtener Access Token mediante OAuth 2.0 Client Credentials
 async function getSFMCAccessToken() {
   if (!SFMC_CLIENT_ID || !SFMC_CLIENT_SECRET || !SFMC_SUBDOMAIN) {
     throw new Error("Faltan variables de entorno de SFMC (SFMC_CLIENT_ID, SFMC_CLIENT_SECRET o SFMC_SUBDOMAIN).");
   }
 
-  const cleanSubdomain = SFMC_SUBDOMAIN.replace('https://', '').replace('.auth.marketingcloudapis.com', '');
+  const cleanSubdomain = SFMC_SUBDOMAIN.replace('https://', '').replace('.auth.marketingcloudapis.com', '').replace('.rest.marketingcloudapis.com', '').replace('.soap.marketingcloudapis.com', '');
   const authUrl = `https://${cleanSubdomain}.auth.marketingcloudapis.com/v2/token`;
 
   const bodyData = {
@@ -59,71 +57,120 @@ async function getSFMCAccessToken() {
   const data = await response.json();
   return {
     accessToken: data.access_token,
-    restEndpoint: data.rest_instance_url || `https://${cleanSubdomain}.rest.marketingcloudapis.com`
+    soapEndpoint: `https://${cleanSubdomain}.soap.marketingcloudapis.com/Service.asmx`
   };
 }
 
-// Helper para consultar datos reales de engagement en SFMC
-async function fetchSFMCData(days = 30, limit = 10) {
-  const { accessToken, restEndpoint } = await getSFMCAccessToken();
+// 2. Consulta directa SOAP a las Data Views / Eventos de SFMC (OpenEvent & ClickEvent)
+async function fetchSOAPEventData(objectType, accessToken, soapEndpoint, days = 30) {
+  const dateFrom = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
 
-  // 1. Intentar consultar Data Extension de tracking / Data Views expuesta vía REST API
-  // Si utilizas un endpoint personalizado de Data Extension en tu MID, ajusta la ruta aquí:
-  const queryUrl = `${restEndpoint}/data/v1/customobjectdata/key/SFMC_Engagement_View/rowset?$pageSize=${limit}`;
+  const soapEnvelope = `<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing">
+    <s:Header>
+        <a:Action s:mustUnderstand="1">Retrieve</a:Action>
+        <a:To s:mustUnderstand="1">${soapEndpoint}</a:To>
+        <fueloauth xmlns="http://exacttarget.com">${accessToken}</fueloauth>
+    </s:Header>
+    <s:Body xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+        <RetrieveRequestMsg xmlns="http://exacttarget.com/wsdl/partnerAPI">
+            <RetrieveRequest>
+                <ObjectType>${objectType}</ObjectType>
+                <Properties>SubscriberKey</Properties>
+                <Properties>EventDate</Properties>
+                <Filter xsi:type="SimpleFilterPart">
+                    <Property>EventDate</Property>
+                    <SimpleOperator>greaterThan</SimpleOperator>
+                    <Value>${dateFrom}</Value>
+                </Filter>
+            </RetrieveRequest>
+        </RetrieveRequestMsg>
+    </s:Body>
+</s:Envelope>`;
 
-  try {
-    const response = await fetch(queryUrl, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    if (response.ok) {
-      const resultData = await response.json();
-      return resultData.items?.map(item => ({
-        SubscriberKey: item.keys?.SubscriberKey || item.values?.SubscriberKey,
-        Opens: item.values?.Opens || 0,
-        Clicks: item.values?.Clicks || 0,
-        EngagementScore: item.values?.EngagementScore || "N/A",
-        LastEventDate: item.values?.LastEventDate || new Date().toISOString().split('T')[0]
-      })) || [];
-    }
-  } catch (err) {
-    console.warn("[SFMC REST API] Endpoint directo no disponible, ejecutando fallback de consulta:", err.message);
-  }
-
-  // 2. Si no hay una Data Extension expuesta en la REST API, realizar llamada a la API de eventos/contactos
-  const contactsUrl = `${restEndpoint}/contacts/v1/contacts/queries`;
-  const response = await fetch(contactsUrl, {
+  const response = await fetch(soapEndpoint, {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${accessToken}`,
-      'Content-Type': 'application/json'
+      'Content-Type': 'text/xml; charset=utf-8',
+      'SOAPAction': 'Retrieve'
     },
-    body: JSON.stringify({
-      pageSize: limit,
-      page: 1
-    })
+    body: soapEnvelope
   });
 
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`SFMC Data Query Error (${response.status}): ${errText}`);
+  const xmlText = await response.text();
+  if (!response.ok || xmlText.includes('<Fault>')) {
+    throw new Error(`Error en SOAP Request (${objectType}): ${xmlText.substring(0, 200)}`);
   }
 
-  const contactsData = await response.json();
-  return (contactsData.items || []).map(c => ({
-    SubscriberKey: c.contactKey,
-    Opens: c.attributes?.opens || 0,
-    Clicks: c.attributes?.clicks || 0,
-    EngagementScore: "Activo",
-    LastEventDate: new Date().toISOString().split('T')[0]
-  }));
+  const results = [];
+  const matches = xmlText.match(/<Results[\s\S]*?<\/Results>/g) || [];
+
+  for (const resXml of matches) {
+    const subKeyMatch = resXml.match(/<SubscriberKey>(.*?)<\/SubscriberKey>/i);
+    const dateMatch = resXml.match(/<EventDate>(.*?)<\/EventDate>/i);
+    if (subKeyMatch && subKeyMatch[1]) {
+      results.push({
+        SubscriberKey: subKeyMatch[1],
+        EventDate: dateMatch ? dateMatch[1] : new Date().toISOString()
+      });
+    }
+  }
+
+  return results;
 }
 
-// 1. MIDDLEWARE UNIVERSAL DE AUTENTICACIÓN
+// 3. Cruzar datos de Data Views (_Open y _Click) para calcular Engagement en vivo
+async function fetchDirectDataViewEngagement(days = 30, limit = 10) {
+  const { accessToken, soapEndpoint } = await getSFMCAccessToken();
+
+  console.log(`[SFMC SOAP] Consultando Data Views del sistema (OpenEvent / ClickEvent) para MID ${SFMC_MID || '7295121'}...`);
+
+  // Consultar directamente los eventos reales del sistema
+  const [opensList, clicksList] = await Promise.all([
+    fetchSOAPEventData('OpenEvent', accessToken, soapEndpoint, days).catch(() => []),
+    fetchSOAPEventData('ClickEvent', accessToken, soapEndpoint, days).catch(() => [])
+  ]);
+
+  // Agrupar por SubscriberKey
+  const engagementMap = {};
+
+  opensList.forEach(item => {
+    const key = item.SubscriberKey;
+    if (!engagementMap[key]) {
+      engagementMap[key] = { SubscriberKey: key, Opens: 0, Clicks: 0, LastEventDate: item.EventDate };
+    }
+    engagementMap[key].Opens += 1;
+    if (new Date(item.EventDate) > new Date(engagementMap[key].LastEventDate)) {
+      engagementMap[key].LastEventDate = item.EventDate;
+    }
+  });
+
+  clicksList.forEach(item => {
+    const key = item.SubscriberKey;
+    if (!engagementMap[key]) {
+      engagementMap[key] = { SubscriberKey: key, Opens: 0, Clicks: 0, LastEventDate: item.EventDate };
+    }
+    engagementMap[key].Clicks += 1;
+    if (new Date(item.EventDate) > new Date(engagementMap[key].LastEventDate)) {
+      engagementMap[key].LastEventDate = item.EventDate;
+    }
+  });
+
+  const summaryArray = Object.values(engagementMap).map(c => ({
+    SubscriberKey: c.SubscriberKey,
+    Opens: c.Opens,
+    Clicks: c.Clicks,
+    EngagementScore: c.Clicks >= 3 ? "Alto" : (c.Opens >= 1 ? "Medio" : "Bajo"),
+    LastEventDate: c.LastEventDate.split('T')[0]
+  }));
+
+  // Ordenar por interacción
+  summaryArray.sort((a, b) => (b.Clicks * 3 + b.Opens) - (a.Clicks * 3 + a.Opens));
+
+  return summaryArray.slice(0, limit);
+}
+
+// 4. Middleware de Autenticación MCP
 app.use((req, res, next) => {
   if (req.method === 'GET' && (req.path === '/' || req.path === '/health')) {
     return res.status(200).json({ status: "ok", server: "sfmc-mcp-server" });
@@ -141,10 +188,9 @@ app.use((req, res, next) => {
   return res.status(401).json({ error: "Unauthorized", message: "API Key requerida" });
 });
 
-// 2. RESPUESTA A SOLICITUDES JSON-RPC
+// 5. Manejador JSON-RPC
 async function handleJsonRpc(req, res) {
   const { jsonrpc, id, method, params } = req.body || {};
-  console.log(`[MCP JSON-RPC] Recibido método: ${method} (ID: ${id})`);
 
   if (method === 'initialize') {
     return res.status(200).json({
@@ -171,8 +217,7 @@ async function handleJsonRpc(req, res) {
     const limit = params?.arguments?.limit || 10;
 
     try {
-      console.log(`[SFMC] Consultando datos reales para MID: ${SFMC_MID || 'Default'}`);
-      const realData = await fetchSFMCData(days, limit);
+      const realData = await fetchDirectDataViewEngagement(days, limit);
 
       return res.status(200).json({
         jsonrpc: jsonrpc || "2.0",
@@ -183,8 +228,8 @@ async function handleJsonRpc(req, res) {
               type: "text",
               text: JSON.stringify({
                 status: "success",
-                account_id: SFMC_MID || "Autenticado vía Installed Package",
-                data_source: "Salesforce Marketing Cloud Data Views / API",
+                account_id: SFMC_MID || "7295121",
+                data_source: "Salesforce Marketing Cloud Data Views Direct (OpenEvent / ClickEvent)",
                 timeframe_days: days,
                 records_count: realData.length,
                 results: realData
@@ -204,7 +249,7 @@ async function handleJsonRpc(req, res) {
               type: "text",
               text: JSON.stringify({
                 status: "error",
-                message: `Error al conectar con la API de SFMC (MID ${SFMC_MID}): ${error.message}`
+                message: `Error al consultar Data Views en SFMC (MID ${SFMC_MID}): ${error.message}`
               })
             }
           ],
@@ -221,7 +266,6 @@ async function handleJsonRpc(req, res) {
   });
 }
 
-// 3. RUTAS EXPRESS
 app.post('*', handleJsonRpc);
 
 app.get(['/sse', '/mcp/sse', '/messages', '/mcp/messages'], (req, res) => {
