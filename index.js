@@ -9,7 +9,6 @@ app.use(express.json());
 // Clave de API configurada en Render
 const VALID_API_KEY = process.env.API_KEY || "sfmc-mcp-secret-key-2026";
 
-// Definición pública de las herramientas para auto-descubrimiento
 const TOOLS_DEFINITION = [
   {
     name: "query_sfmc_engagement",
@@ -24,13 +23,13 @@ const TOOLS_DEFINITION = [
   }
 ];
 
-// 1. MIDDLEWARE DE AUTENTICACIÓN
-app.use((req, res, next) => {
-  // Permitir chequeos de salud simples en la raíz sin credenciales
-  if (req.method === 'GET' && (req.path === '/' || req.path === '/health')) {
-    return res.status(200).json({ status: "ok", server: "sfmc-mcp-server" });
-  }
+// 1. CHEQUEO DE SALUD LIBRE (Para probes de Render / Azure)
+app.get(['/', '/health'], (req, res) => {
+  res.status(200).json({ status: "ok", server: "sfmc-mcp-server" });
+});
 
+// 2. MIDDLEWARE DE AUTENTICACIÓN
+app.use((req, res, next) => {
   const apiKeyHeader = req.headers['x-api-key'];
   const authHeader = req.headers['authorization'];
   const providedKey = apiKeyHeader || (authHeader ? authHeader.replace('Bearer ', '') : null);
@@ -40,20 +39,10 @@ app.use((req, res, next) => {
   }
 
   console.warn(`[AUTH ERROR] Petición rechazada en ${req.path} desde IP: ${req.ip}`);
-  return res.status(401).json({ error: "Unauthorized", message: "API Key requerida" });
+  return res.status(401).json({ error: "Unauthorized", message: "API Key inválida o no proporcionada" });
 });
 
-// 2. RESPONDER A RUTAS DE DESCUBRIMIENTO QUE COPILOT PUEDA PROBAR (Evita el 404)
-app.get(['/mcp', '/.well-known/mcp.json', '/tools', '/v1/tools'], (req, res) => {
-  res.status(200).json({
-    name: "sfmc-mcp-server",
-    version: "1.0.0",
-    protocolVersion: "2024-11-05",
-    tools: TOOLS_DEFINITION
-  });
-});
-
-// 3. CONFIGURACIÓN DEL SERVIDOR MCP OFICIAL
+// 3. CONFIGURACIÓN DEL SERVIDOR MCP
 const sessions = new Map();
 const mcpServer = new Server(
   { name: "sfmc-mcp-server", version: "1.0.0" },
@@ -64,9 +53,9 @@ mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
   return { tools: TOOLS_DEFINITION };
 });
 
-// 4. ENDPOINTS SSE Y MESSAGES
+// 4. ENDPOINTS SSE Y MANEJO DE MENSAJES (Soporta handshake directo de Copilot Studio)
 app.get(["/sse", "/mcp/sse"], async (req, res) => {
-  console.log("[MCP] Conexión SSE iniciada correctamente por Copilot Studio");
+  console.log("[MCP] Conexión SSE solicitada por Copilot Studio");
   const transport = new SSEServerTransport("/messages", res);
   sessions.set(transport.sessionId, transport);
 
@@ -77,16 +66,33 @@ app.get(["/sse", "/mcp/sse"], async (req, res) => {
   await mcpServer.connect(transport);
 });
 
-app.post(["/messages", "/mcp/messages"], async (req, res) => {
+// POST que gestiona tanto los mensajes de sesión SSE como las peticiones de inicialización directa
+app.post(["/", "/messages", "/mcp/messages"], async (req, res) => {
   const sessionId = req.query.sessionId;
-  const transport = sessions.get(sessionId);
-
-  if (transport) {
+  
+  if (sessionId && sessions.has(sessionId)) {
+    const transport = sessions.get(sessionId);
     await transport.handlePostMessage(req, res);
-  } else {
-    // Si la sesión aún no se ha creado por SSE, devolver OK básico para evitar 404 en sondas
-    res.status(200).json({ status: "ready" });
+    return;
   }
+
+  // Si Copilot Studio envía el handshake sin sessionId previo, responder HTTP 200 OK
+  if (req.body && (req.body.method === 'initialize' || req.body.method === 'tools/list')) {
+    console.log(`[MCP] Handshake inicial de Copilot Studio recibido (${req.body.method})`);
+    return res.status(200).json({
+      jsonrpc: "2.0",
+      id: req.body.id || 1,
+      result: {
+        protocolVersion: "2024-11-05",
+        capabilities: { tools: {} },
+        serverInfo: { name: "sfmc-mcp-server", version: "1.0.0" },
+        tools: TOOLS_DEFINITION
+      }
+    });
+  }
+
+  // Respuesta por defecto para no devolver 404 en sondas de salud o validación
+  return res.status(200).json({ status: "ready", tools: TOOLS_DEFINITION });
 });
 
 const PORT = process.env.PORT || 3000;
