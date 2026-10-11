@@ -1,27 +1,17 @@
 import express from 'express';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
-import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
 const app = express();
 app.use(express.json());
-
-// 1. LOGGER DE DIAGNÒSTIC (Mostra totes les peticions a la consola de Render)
-app.use((req, res, next) => {
-  console.log(`[PETICIÓ ENTRANTS] ${req.method} ${req.url} - Headers:`, JSON.stringify({
-    'x-api-key': req.headers['x-api-key'],
-    'content-type': req.headers['content-type'],
-    'user-agent': req.headers['user-agent']
-  }));
-  next();
-});
 
 const VALID_API_KEY = process.env.API_KEY || "sfmc-mcp-secret-key-2026";
 
 const TOOLS_DEFINITION = [
   {
     name: "query_sfmc_engagement",
-    description: "Consulta les Data Views de Salesforce Marketing Cloud (_Sent, _Open, _Click) per extreure mètriques d'engagement.",
+    description: "Consulta las Data Views de Salesforce Marketing Cloud (_Sent, _Open, _Click) para extraer métricas de engagement.",
     inputSchema: {
       type: "object",
       properties: {
@@ -32,12 +22,12 @@ const TOOLS_DEFINITION = [
   }
 ];
 
-// 2. RUTES DE SALUT
-app.get(['/', '/health', '/mcp'], (req, res) => {
-  res.status(200).json({ status: "ok", server: "sfmc-mcp-server", tools: TOOLS_DEFINITION });
+// 1. RUTA DE SALUD
+app.get(['/', '/health'], (req, res) => {
+  res.status(200).json({ status: "ok", server: "sfmc-mcp-server" });
 });
 
-// 3. MIDDLEWARE D'AUTENTICACIÓ
+// 2. MIDDLEWARE DE AUTENTICACIÓN POR API KEY
 app.use((req, res, next) => {
   if (req.method === 'GET' && (req.path === '/' || req.path === '/health')) return next();
 
@@ -49,24 +39,58 @@ app.use((req, res, next) => {
     return next();
   }
 
-  console.warn(`[AUTH ERROR] Clau no vàlida a ${req.path}`);
+  console.warn(`[AUTH ERROR] Petición no autorizada en ${req.path}`);
   return res.status(401).json({ error: "Unauthorized", message: "API Key requerida" });
 });
 
-// 4. SERVIDOR MCP
+// 3. CONFIGURACIÓN DEL SERVIDOR MCP
 const sessions = new Map();
 const mcpServer = new Server(
   { name: "sfmc-mcp-server", version: "1.0.0" },
   { capabilities: { tools: {} } }
 );
 
+// Manejador para Listar Herramientas
 mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
   return { tools: TOOLS_DEFINITION };
 });
 
-// 5. ATENDRE SSE I MANIFEST A QUALSEVOL RUTA
-app.get(["/sse", "/mcp/sse", "*/sse"], async (req, res) => {
-  console.log("[MCP] Conexió SSE iniciada");
+// Manejador para EJECUTAR la Herramienta (AQUÍ ESTABA LA CLAVE)
+mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
+  console.log(`[MCP TOOL CALL] Ejecutando herramienta: ${request.params.name}`);
+
+  if (request.params.name === "query_sfmc_engagement") {
+    const days = request.params.arguments?.days || 30;
+    const limit = request.params.arguments?.limit || 10;
+
+    // Aquí irá tu consulta SQL real a SFMC a través de REST/SOAP API
+    // Por ahora devolvemos la estructura de datos que espera el orquestador:
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            status: "success",
+            data_source: "Salesforce Marketing Cloud Data Views (_Sent, _Open, _Click)",
+            timeframe_days: days,
+            records_count: limit,
+            results: [
+              { SubscriberKey: "0035000002ABC1", Opens: 14, Clicks: 5, EngagementScore: "Alto", LastEventDate: "2026-10-10" },
+              { SubscriberKey: "0035000002ABC2", Opens: 11, Clicks: 3, EngagementScore: "Alto", LastEventDate: "2026-10-09" },
+              { SubscriberKey: "0035000002ABC3", Opens: 8, Clicks: 2, EngagementScore: "Medio", LastEventDate: "2026-10-08" }
+            ]
+          })
+        }
+      ]
+    };
+  }
+
+  throw new Error(`Herramienta no encontrada: ${request.params.name}`);
+});
+
+// 4. RUTAS SSE Y MENSAJES
+app.get(["/sse", "/mcp/sse"], async (req, res) => {
+  console.log("[MCP SSE] Nueva conexión establecida");
   const transport = new SSEServerTransport("/messages", res);
   sessions.set(transport.sessionId, transport);
 
@@ -74,28 +98,30 @@ app.get(["/sse", "/mcp/sse", "*/sse"], async (req, res) => {
   await mcpServer.connect(transport);
 });
 
-// Respostes per a peticions POST
-app.all("*", async (req, res) => {
+app.post(["/messages", "/mcp/messages", "/"], async (req, res) => {
   const sessionId = req.query.sessionId;
-  
+
   if (sessionId && sessions.has(sessionId)) {
     const transport = sessions.get(sessionId);
     await transport.handlePostMessage(req, res);
     return;
   }
 
-  // Resposta per defecte per evitar qualsevol 404 en la negociació inicial de Power Platform
-  console.log(`[MCP HANDSHAKE] Responent 200 OK a ${req.method} ${req.path}`);
-  return res.status(200).json({
-    jsonrpc: "2.0",
-    id: req.body?.id || 1,
-    result: {
-      protocolVersion: "2024-11-05",
-      capabilities: { tools: {} },
-      serverInfo: { name: "sfmc-mcp-server", version: "1.0.0" },
-      tools: TOOLS_DEFINITION
-    }
-  });
+  // Soporte directo JSON-RPC para Copilot Studio
+  if (req.body && (req.body.method === 'initialize' || req.body.method === 'tools/list')) {
+    return res.status(200).json({
+      jsonrpc: "2.0",
+      id: req.body.id || 1,
+      result: {
+        protocolVersion: "2024-11-05",
+        capabilities: { tools: {} },
+        serverInfo: { name: "sfmc-mcp-server", version: "1.0.0" },
+        tools: TOOLS_DEFINITION
+      }
+    });
+  }
+
+  return res.status(200).json({ status: "ready" });
 });
 
 const PORT = process.env.PORT || 3000;
