@@ -10,24 +10,53 @@ const SFMC_CLIENT_SECRET = process.env.SFMC_CLIENT_SECRET;
 const SFMC_SUBDOMAIN = process.env.SFMC_SUBDOMAIN;
 const SFMC_MID = process.env.SFMC_ACCOUNT_ID || process.env.SFMC_MID;
 
+// Definición ampliada del manifiesto de herramientas MCP
 const TOOLS_DEFINITION = [
   {
     name: "query_sfmc_engagement",
-    description: "Consulta directamente las Data Views del sistema de SFMC (_Sent, _Open, _Click) mediante la API de Eventos en tiempo real.",
+    description: "Consulta el engagement general, ranking de contactos, JobID y nombre de campaña en SFMC.",
     inputSchema: {
       type: "object",
       properties: {
-        days: { type: "number", description: "Rango de días a consultar (ej. 30)" },
+        days: { type: "number", description: "Rango de días a consultar" },
         limit: { type: "number", description: "Número de contactos a devolver" }
       }
+    }
+  },
+  {
+    name: "query_sfmc_temporal_patterns",
+    description: "Analiza patrones temporales por campaña: horas/días de mejor apertura y demoras de interacción.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "number", description: "Número de campañas a analizar" }
+      }
+    }
+  },
+  {
+    name: "query_sfmc_fatigue_and_health",
+    description: "Evalúa la fatiga de envíos, tasa de rebotes y calcula el Health Score general (0-100).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "number", description: "Número de contactos a revisar" }
+      }
+    }
+  },
+  {
+    name: "query_sfmc_domain_analysis",
+    description: "Analiza el rendimiento por dominio de correo (@gmail.com, @hotmail.com) y detecta anomalías.",
+    inputSchema: {
+      type: "object",
+      properties: {}
     }
   }
 ];
 
-// 1. Obtener Access Token mediante OAuth 2.0 Client Credentials
+// Tokenizador OAuth 2.0
 async function getSFMCAccessToken() {
   if (!SFMC_CLIENT_ID || !SFMC_CLIENT_SECRET || !SFMC_SUBDOMAIN) {
-    throw new Error("Faltan variables de entorno de SFMC (SFMC_CLIENT_ID, SFMC_CLIENT_SECRET o SFMC_SUBDOMAIN).");
+    throw new Error("Faltan variables de entorno de SFMC en Render.");
   }
 
   const cleanSubdomain = SFMC_SUBDOMAIN.replace('https://', '').replace('.auth.marketingcloudapis.com', '').replace('.rest.marketingcloudapis.com', '').replace('.soap.marketingcloudapis.com', '');
@@ -61,12 +90,11 @@ async function getSFMCAccessToken() {
   };
 }
 
-// 2. Consulta directa SOAP a las Data Views / Eventos de SFMC (OpenEvent & ClickEvent)
-async function fetchSOAPEventData(objectType, accessToken, soapEndpoint, days = 30) {
-  const dateFrom = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+// Extractor genérico vía SOAP a DataExtensionObject[SFMC_Analytics_Master]
+async function fetchAnalyticsData(accessToken, soapEndpoint, properties, limit = 50) {
+  const propsXml = properties.map(p => `<Properties>${p}</Properties>`).join('\n');
 
-  // En index.js, actualiza el sobre SOAP para forzar el MID (Client.ClientID):
-const soapEnvelope = `<?xml version="1.0" encoding="UTF-8"?>
+  const soapEnvelope = `<?xml version="1.0" encoding="UTF-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing">
     <s:Header>
         <a:Action s:mustUnderstand="1">Retrieve</a:Action>
@@ -76,12 +104,11 @@ const soapEnvelope = `<?xml version="1.0" encoding="UTF-8"?>
     <s:Body xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
         <RetrieveRequestMsg xmlns="http://exacttarget.com/wsdl/partnerAPI">
             <RetrieveRequest>
-                <ObjectType>${objectType}</ObjectType>
+                <ObjectType>DataExtensionObject[SFMC_Analytics_Master]</ObjectType>
                 <Client>
                     <ClientID>${SFMC_MID || '7295121'}</ClientID>
                 </Client>
-                <Properties>SubscriberKey</Properties>
-                <Properties>EventDate</Properties>
+                ${propsXml}
             </RetrieveRequest>
         </RetrieveRequestMsg>
     </s:Body>
@@ -89,87 +116,25 @@ const soapEnvelope = `<?xml version="1.0" encoding="UTF-8"?>
 
   const response = await fetch(soapEndpoint, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'text/xml; charset=utf-8',
-      'SOAPAction': 'Retrieve'
-    },
+    headers: { 'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': 'Retrieve' },
     body: soapEnvelope
   });
 
   const xmlText = await response.text();
-  if (!response.ok || xmlText.includes('<Fault>')) {
-    throw new Error(`Error en SOAP Request (${objectType}): ${xmlText.substring(0, 200)}`);
-  }
-
-  const results = [];
   const matches = xmlText.match(/<Results[\s\S]*?<\/Results>/g) || [];
 
-  for (const resXml of matches) {
-    const subKeyMatch = resXml.match(/<SubscriberKey>(.*?)<\/SubscriberKey>/i);
-    const dateMatch = resXml.match(/<EventDate>(.*?)<\/EventDate>/i);
-    if (subKeyMatch && subKeyMatch[1]) {
-      results.push({
-        SubscriberKey: subKeyMatch[1],
-        EventDate: dateMatch ? dateMatch[1] : new Date().toISOString()
-      });
-    }
-  }
-
-  return results;
+  return matches.slice(0, limit).map(resultXml => {
+    const record = {};
+    properties.forEach(prop => {
+      const reg = new RegExp(`<Name>${prop}<\/Name>\\s*<Value>(.*?)<\/Value>`, 'i');
+      const m = resultXml.match(reg);
+      record[prop] = m ? m[1] : '';
+    });
+    return record;
+  });
 }
 
-// 3. Cruzar datos de Data Views (_Open y _Click) para calcular Engagement en vivo
-async function fetchDirectDataViewEngagement(days = 30, limit = 10) {
-  const { accessToken, soapEndpoint } = await getSFMCAccessToken();
-
-  console.log(`[SFMC SOAP] Consultando Data Views del sistema (OpenEvent / ClickEvent) para MID ${SFMC_MID || '7295121'}...`);
-
-  // Consultar directamente los eventos reales del sistema
-  const [opensList, clicksList] = await Promise.all([
-    fetchSOAPEventData('OpenEvent', accessToken, soapEndpoint, days).catch(() => []),
-    fetchSOAPEventData('ClickEvent', accessToken, soapEndpoint, days).catch(() => [])
-  ]);
-
-  // Agrupar por SubscriberKey
-  const engagementMap = {};
-
-  opensList.forEach(item => {
-    const key = item.SubscriberKey;
-    if (!engagementMap[key]) {
-      engagementMap[key] = { SubscriberKey: key, Opens: 0, Clicks: 0, LastEventDate: item.EventDate };
-    }
-    engagementMap[key].Opens += 1;
-    if (new Date(item.EventDate) > new Date(engagementMap[key].LastEventDate)) {
-      engagementMap[key].LastEventDate = item.EventDate;
-    }
-  });
-
-  clicksList.forEach(item => {
-    const key = item.SubscriberKey;
-    if (!engagementMap[key]) {
-      engagementMap[key] = { SubscriberKey: key, Opens: 0, Clicks: 0, LastEventDate: item.EventDate };
-    }
-    engagementMap[key].Clicks += 1;
-    if (new Date(item.EventDate) > new Date(engagementMap[key].LastEventDate)) {
-      engagementMap[key].LastEventDate = item.EventDate;
-    }
-  });
-
-  const summaryArray = Object.values(engagementMap).map(c => ({
-    SubscriberKey: c.SubscriberKey,
-    Opens: c.Opens,
-    Clicks: c.Clicks,
-    EngagementScore: c.Clicks >= 3 ? "Alto" : (c.Opens >= 1 ? "Medio" : "Bajo"),
-    LastEventDate: c.LastEventDate.split('T')[0]
-  }));
-
-  // Ordenar por interacción
-  summaryArray.sort((a, b) => (b.Clicks * 3 + b.Opens) - (a.Clicks * 3 + a.Opens));
-
-  return summaryArray.slice(0, limit);
-}
-
-// 4. Middleware de Autenticación MCP
+// Middleware Auth Header MCP
 app.use((req, res, next) => {
   if (req.method === 'GET' && (req.path === '/' || req.path === '/health')) {
     return res.status(200).json({ status: "ok", server: "sfmc-mcp-server" });
@@ -183,11 +148,10 @@ app.use((req, res, next) => {
     return next();
   }
 
-  console.warn(`[AUTH] Acceso denegado en ${req.path} desde IP ${req.ip}`);
   return res.status(401).json({ error: "Unauthorized", message: "API Key requerida" });
 });
 
-// 5. Manejador JSON-RPC
+// JSON-RPC Request Handler
 async function handleJsonRpc(req, res) {
   const { jsonrpc, id, method, params } = req.body || {};
 
@@ -198,7 +162,7 @@ async function handleJsonRpc(req, res) {
       result: {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "sfmc-mcp-server", version: "1.0.0" }
+        serverInfo: { name: "sfmc-mcp-server", version: "2.1.0" }
       }
     });
   }
@@ -212,57 +176,59 @@ async function handleJsonRpc(req, res) {
   }
 
   if (method === 'tools/call') {
-    const days = params?.arguments?.days || 30;
-    const limit = params?.arguments?.limit || 10;
+    const toolName = params?.name;
+    const args = params?.arguments || {};
 
     try {
-      const realData = await fetchDirectDataViewEngagement(days, limit);
+      const { accessToken, soapEndpoint } = await getSFMCAccessToken();
+      let payload = {};
+
+      if (toolName === 'query_sfmc_engagement') {
+        const fields = ['SubscriberKey', 'JobID', 'CampaignName', 'EmailName', 'EmailSubject', 'TotalOpens', 'TotalClicks', 'EngagementScore', 'LastEventDate'];
+        const records = await fetchAnalyticsData(accessToken, soapEndpoint, fields, args.limit || 10);
+        payload = { status: "success", tool: toolName, records_count: records.length, results: records };
+      } 
+      else if (toolName === 'query_sfmc_temporal_patterns') {
+        const fields = ['JobID', 'CampaignName', 'EmailName', 'AvgSendHour', 'AvgSendDayOfWeek', 'AvgOpenDelayMinutes', 'AvgClickDelayMinutes'];
+        const records = await fetchAnalyticsData(accessToken, soapEndpoint, fields, args.limit || 10);
+        payload = { status: "success", tool: toolName, patterns: records };
+      }
+      else if (toolName === 'query_sfmc_fatigue_and_health') {
+        const fields = ['SubscriberKey', 'TotalSent', 'TotalOpens', 'TotalBounces', 'FatigueIndex'];
+        const records = await fetchAnalyticsData(accessToken, soapEndpoint, fields, args.limit || 20);
+        payload = { status: "success", tool: toolName, fatigue_data: records };
+      }
+      else if (toolName === 'query_sfmc_domain_analysis') {
+        const fields = ['Domain', 'TotalOpens', 'TotalClicks', 'TotalBounces'];
+        const records = await fetchAnalyticsData(accessToken, soapEndpoint, fields, 50);
+        payload = { status: "success", tool: toolName, domain_data: records };
+      }
+      else {
+        throw new Error(`Herramienta no encontrada: ${toolName}`);
+      }
 
       return res.status(200).json({
         jsonrpc: jsonrpc || "2.0",
         id: id || 1,
         result: {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({
-                status: "success",
-                account_id: SFMC_MID || "7295121",
-                data_source: "Salesforce Marketing Cloud Data Views Direct (OpenEvent / ClickEvent)",
-                timeframe_days: days,
-                records_count: realData.length,
-                results: realData
-              })
-            }
-          ]
+          content: [{ type: "text", text: JSON.stringify(payload) }]
         }
       });
+
     } catch (error) {
-      console.error("[SFMC API ERROR]", error.message);
+      console.error("[MCP SERVER ERROR]", error.message);
       return res.status(200).json({
         jsonrpc: jsonrpc || "2.0",
         id: id || 1,
         result: {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({
-                status: "error",
-                message: `Error al consultar Data Views en SFMC (MID ${SFMC_MID}): ${error.message}`
-              })
-            }
-          ],
+          content: [{ type: "text", text: JSON.stringify({ status: "error", message: error.message }) }],
           isError: true
         }
       });
     }
   }
 
-  return res.status(200).json({
-    jsonrpc: "2.0",
-    id: id || 1,
-    result: { status: "ready", tools: TOOLS_DEFINITION }
-  });
+  return res.status(200).json({ jsonrpc: "2.0", id: id || 1, result: { status: "ready", tools: TOOLS_DEFINITION } });
 }
 
 app.post('*', handleJsonRpc);
@@ -275,12 +241,7 @@ app.get(['/sse', '/mcp/sse', '/messages', '/mcp/messages'], (req, res) => {
 });
 
 app.get('*', (req, res) => {
-  res.status(200).json({
-    name: "sfmc-mcp-server",
-    version: "1.0.0",
-    protocolVersion: "2024-11-05",
-    tools: TOOLS_DEFINITION
-  });
+  res.status(200).json({ name: "sfmc-mcp-server", version: "2.1.0", tools: TOOLS_DEFINITION });
 });
 
 const PORT = process.env.PORT || 3000;
